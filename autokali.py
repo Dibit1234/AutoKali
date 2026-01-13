@@ -20,6 +20,7 @@ from urllib.parse import urljoin
 
 VERSION = "1.3"
 
+# Keep the 3 blank lines at the end (requested)
 BANNER = rf"""
     _         _        _  __      _ _
    / \  _   _| |_ ___ | |/ /__ _ | (_)
@@ -33,6 +34,37 @@ BANNER = rf"""
 
 # Global stop flag used for fast graceful exit
 STOP = threading.Event()
+
+# Centralized defaults (tunable via CLI)
+DEFAULT_TIMEOUTS = {
+    "whois": 45,
+    "dig": 30,
+    "nmap_common": 2400,
+    "nmap_top": 3600,
+    "nmap_all": 7200,
+    "whatweb": 900,
+    "sslscan": 1800,
+    "http_probe": 10,
+    "http_fetch": 10,
+    "http_connect": 3,
+}
+
+CONFIG: Dict[str, object] = {
+    "timeout_mult": 1.0,
+    "http_timeout": DEFAULT_TIMEOUTS["http_fetch"],
+    "http_probe_timeout": DEFAULT_TIMEOUTS["http_probe"],
+    "http_connect_timeout": DEFAULT_TIMEOUTS["http_connect"],
+    "max_redirs": 5,
+    "use_pn": True,
+    "tls_only_if_https_or_443": True,
+}
+
+
+def T(key: str) -> int:
+    """Scaled module timeouts."""
+    mult = float(CONFIG.get("timeout_mult", 1.0))
+    base = DEFAULT_TIMEOUTS[key]
+    return int(max(1, base * mult))
 
 
 # ---------------------------- argparse (banner help) ----------------------------
@@ -259,7 +291,6 @@ def run_capture_with_stop(cmd: List[str], timeout: int) -> Tuple[int, str, str, 
 
             rc = p.poll()
             if rc is not None:
-                # read remaining
                 try:
                     rest = p.stdout.read() if p.stdout else b""
                     if rest:
@@ -270,7 +301,6 @@ def run_capture_with_stop(cmd: List[str], timeout: int) -> Tuple[int, str, str, 
                 status = "ok" if rc == 0 else f"rc={rc}"
                 return rc, status, txt, time.time() - t0
 
-            # read incrementally
             try:
                 if p.stdout:
                     data = p.stdout.read1(4096)
@@ -307,10 +337,35 @@ class Target:
 
 # ---------------------------- web helpers ----------------------------
 
-def http_fetch(url: str, timeout_s: int = 10, max_kb: int = 512) -> Tuple[int, Dict[str, str], str]:
+def http_fetch(
+    url: str,
+    timeout_s: int = 10,
+    connect_timeout: int = 3,
+    max_kb: int = 512,
+    max_redirs: int = 5,
+) -> Tuple[int, Dict[str, str], str]:
+    """
+    curl fetch with fast failure:
+      - connect timeout
+      - max time
+      - redirect cap
+      - filesize cap
+    """
     if not have_tool("curl"):
         return 0, {}, ""
-    cmd = ["curl", "-k", "-sS", "-L", "--max-time", str(timeout_s), "-D", "-", url]
+
+    # Note: --max-filesize is bytes
+    cmd = [
+        "curl",
+        "-k", "-sS", "-L",
+        "--connect-timeout", str(connect_timeout),
+        "--max-time", str(timeout_s),
+        "--max-redirs", str(max_redirs),
+        "--max-filesize", str(max_kb * 1024),
+        "-D", "-",
+        url,
+    ]
+
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
         out = p.stdout.decode("utf-8", errors="ignore")
@@ -402,6 +457,12 @@ def extract_nmap_open_port_lines(nmap_text: str) -> List[str]:
             lines.append(re.sub(r"\s+", " ", l))
     return lines
 
+def nmap_has_open_443(nmap_text: str) -> bool:
+    for l in nmap_text.splitlines():
+        if l.strip().startswith("443/tcp") and re.search(r"\sopen\s", " " + l + " ", flags=re.I):
+            return True
+    return False
+
 
 # ---------------------------- modules ----------------------------
 
@@ -421,7 +482,7 @@ def mod_whois(t: Target, tdir: Path, verbose: str) -> None:
     if STOP.is_set():
         write_text(out, "stopped\n")
         return
-    run_cmd_with_progress(["whois", t.raw], out, timeout=45, label="whois", est_sec=5.0, verbose=verbose)
+    run_cmd_with_progress(["whois", t.raw], out, timeout=T("whois"), label="whois", est_sec=5.0, verbose=verbose)
 
 def mod_dig(t: Target, tdir: Path, verbose: str) -> None:
     out = tdir / "02_dig.txt"
@@ -435,7 +496,7 @@ def mod_dig(t: Target, tdir: Path, verbose: str) -> None:
         write_text(out, "stopped\n")
         return
     cmd = ["dig", "+noall", "+answer", t.raw, "A", "AAAA", "MX", "NS", "TXT"]
-    run_cmd_with_progress(cmd, out, timeout=30, label="dig", est_sec=3.0, verbose=verbose)
+    run_cmd_with_progress(cmd, out, timeout=T("dig"), label="dig", est_sec=3.0, verbose=verbose)
 
 def mod_nmap(t: Target, tdir: Path, scan_all: bool, top_ports: Optional[int], timing: str, verbose: str) -> None:
     """
@@ -456,15 +517,15 @@ def mod_nmap(t: Target, tdir: Path, scan_all: bool, top_ports: Optional[int], ti
 
     if scan_all:
         port_args = ["-p-"]
-        timeout = 7200
+        timeout = T("nmap_all")
         label = "nmap all-ports"
     elif top_ports is not None:
         port_args = [f"--top-ports={top_ports}"]
-        timeout = 3600
+        timeout = T("nmap_top")
         label = f"nmap top-{top_ports}"
     else:
         port_args = ["-F"]
-        timeout = 2400
+        timeout = T("nmap_common")
         label = "nmap common"
 
     ips_to_scan = t.ips if t.ips else ([t.raw] if is_ip(t.raw) else [])
@@ -473,6 +534,8 @@ def mod_nmap(t: Target, tdir: Path, scan_all: bool, top_ports: Optional[int], ti
         return
 
     chunks: List[str] = []
+    use_pn = bool(CONFIG.get("use_pn", True))
+
     for ip in ips_to_scan:
         if STOP.is_set():
             chunks.append(f"======={ip}======")
@@ -485,7 +548,12 @@ def mod_nmap(t: Target, tdir: Path, scan_all: bool, top_ports: Optional[int], ti
         elif verbose == "high":
             print(f"\n[cmd] {label} ({ip})")
 
-        cmd = ["nmap", scan_flag, *port_args, "-sV", "--version-light", timing, "--reason", "-Pn", ip]
+        # Put -Pn early (requested) for speed/reliability in environments that block host discovery.
+        cmd = ["nmap"]
+        if use_pn:
+            cmd.append("-Pn")
+        cmd += [scan_flag, *port_args, "-sV", "--version-light", timing, "--reason", ip]
+
         rc, status, txt, _sec = run_capture_with_stop(cmd, timeout=timeout)
 
         chunks.append(f"======={ip}======")
@@ -503,7 +571,7 @@ def mod_nmap(t: Target, tdir: Path, scan_all: bool, top_ports: Optional[int], ti
 
     write_text(out, "\n".join(chunks).rstrip() + "\n")
 
-def mod_whatweb(t: Target, tdir: Path, verbose: str) -> None:
+def mod_whatweb(t: Target, tdir: Path, verbose: str, base_url: str) -> None:
     out = tdir / "30_whatweb.txt"
     if not have_tool("whatweb"):
         write_text(out, "whatweb not found in PATH\n")
@@ -511,13 +579,22 @@ def mod_whatweb(t: Target, tdir: Path, verbose: str) -> None:
     if STOP.is_set():
         write_text(out, "stopped\n")
         return
-    probes = [f"http://{t.raw}", f"https://{t.raw}"]
-    cmd = ["whatweb", "--no-errors", "--color=never"] + probes
-    run_cmd_with_progress(cmd, out, timeout=900, label="whatweb", est_sec=10.0, verbose=verbose)
+    if not base_url:
+        write_text(out, "whatweb skipped (no reachable base URL)\n")
+        return
 
-def mod_sslscan(t: Target, tdir: Path, verbose: str) -> None:
+    # Use only the working base URL for speed (instead of probing both schemes every time)
+    cmd = ["whatweb", "--no-errors", "--color=never", base_url]
+    run_cmd_with_progress(cmd, out, timeout=T("whatweb"), label="whatweb", est_sec=10.0, verbose=verbose)
+
+def mod_sslscan(t: Target, tdir: Path, verbose: str, should_run: bool) -> None:
     raw_out = tdir / "40_sslscan_raw.txt"
     findings_out = tdir / "41_tls_findings.txt"
+
+    if not should_run:
+        write_text(raw_out, "sslscan skipped (no HTTPS/443 evidence)\n")
+        write_text(findings_out, "sslscan skipped (no HTTPS/443 evidence)\n")
+        return
 
     if not have_tool("sslscan"):
         write_text(raw_out, "sslscan not found in PATH\n")
@@ -542,7 +619,7 @@ def mod_sslscan(t: Target, tdir: Path, verbose: str) -> None:
         return
 
     cmd = ["sslscan", "--no-colour", "--show-certificate"] + endpoints
-    run_cmd_with_progress(cmd, raw_out, timeout=1800, label="sslscan", est_sec=12.0, verbose=verbose)
+    run_cmd_with_progress(cmd, raw_out, timeout=T("sslscan"), label="sslscan", est_sec=12.0, verbose=verbose)
 
     raw_text = read_text(raw_out)
     expired, weak_lines, nb, na = parse_sslscan_findings(raw_text)
@@ -580,7 +657,13 @@ def mod_web_passive(t: Target, tdir: Path) -> Dict[str, str]:
     for url in candidates:
         if STOP.is_set():
             break
-        st, hdr, body = http_fetch(url, timeout_s=10, max_kb=512)
+        st, hdr, body = http_fetch(
+            url,
+            timeout_s=int(CONFIG.get("http_probe_timeout", T("http_probe"))),
+            connect_timeout=int(CONFIG.get("http_connect_timeout", T("http_connect"))),
+            max_kb=64,  # smaller for probe
+            max_redirs=int(CONFIG.get("max_redirs", 5)),
+        )
         rows.append(f"URL: {url}")
         rows.append(f"Status: {st}")
         for k in ("server", "x-powered-by", "content-type", "location"):
@@ -602,7 +685,13 @@ def mod_web_passive(t: Target, tdir: Path) -> Dict[str, str]:
         for fname, url in fetch_map.items():
             if STOP.is_set():
                 break
-            st, _hdr, body = http_fetch(url, timeout_s=10, max_kb=256)
+            st, _hdr, body = http_fetch(
+                url,
+                timeout_s=int(CONFIG.get("http_timeout", T("http_fetch"))),
+                connect_timeout=int(CONFIG.get("http_connect_timeout", T("http_connect"))),
+                max_kb=256,
+                max_redirs=int(CONFIG.get("max_redirs", 5)),
+            )
             write_text(tdir / fname, f"URL: {url}\nStatus: {st}\n\n{body}\n")
 
         if not STOP.is_set():
@@ -653,7 +742,13 @@ def mod_endpoint_checks(t: Target, tdir: Path, base_url: str, endpoint_file: Opt
             rows.append("[STOPPED]")
             break
         url = urljoin(base_url + "/", p.lstrip("/"))
-        st, _hdr, _body = http_fetch(url, timeout_s=10, max_kb=16)
+        st, _hdr, _body = http_fetch(
+            url,
+            timeout_s=int(CONFIG.get("http_probe_timeout", T("http_probe"))),
+            connect_timeout=int(CONFIG.get("http_connect_timeout", T("http_connect"))),
+            max_kb=16,
+            max_redirs=int(CONFIG.get("max_redirs", 5)),
+        )
         rows.append(f"{st:>3}  {p}  ({url})")
 
     write_text(out, "\n".join(rows).rstrip() + "\n")
@@ -673,7 +768,13 @@ def mod_wp_detect(t: Target, tdir: Path, base_url: str, homepage_body: str) -> N
 
     if base_url and not STOP.is_set():
         for path in ("wp-login.php", "wp-json/"):
-            st, _hdr, _body = http_fetch(urljoin(base_url + "/", path), timeout_s=10, max_kb=16)
+            st, _hdr, _body = http_fetch(
+                urljoin(base_url + "/", path),
+                timeout_s=int(CONFIG.get("http_probe_timeout", T("http_probe"))),
+                connect_timeout=int(CONFIG.get("http_connect_timeout", T("http_connect"))),
+                max_kb=16,
+                max_redirs=int(CONFIG.get("max_redirs", 5)),
+            )
             if st in (200, 301, 302, 401, 403):
                 evidence.append(f"Endpoint check: {path} returned {st}")
 
@@ -744,6 +845,12 @@ def build_readme_text() -> str:
         "- `90_all_outputs.txt` (concatenation of all outputs)",
         "- `91_important.txt` (high-signal summary only)",
         "",
+        "## Efficiency / speed-related behavior",
+        "- Centralized timeouts (tunable with `--timeout-mult`, `--http-timeout`, `--http-connect-timeout`, `--max-redirs`).",
+        "- Nmap uses `-Pn` by default (disable with `--no-pn`).",
+        "- WhatWeb runs only when a reachable base URL is found.",
+        "- TLS scan can be skipped unless there is HTTPS/443 evidence (disable with `--tls-always`).",
+        "",
         "## What it runs (defaults ON if tool exists)",
         "- DNS resolve (domains -> A/AAAA)",
         "- WHOIS (if `whois` installed)",
@@ -752,12 +859,11 @@ def build_readme_text() -> str:
         "  - `--TopPorts N` for top-N ports",
         "  - `--ScanAll` for full 1–65535 (`-p-`)",
         "  - Output is consolidated into `10_nmap.txt` with `=======IP=======` sections and **only** open ports + errors.",
-        "- WhatWeb fingerprinting (if `whatweb` installed)",
-        "- TLS scan via `sslscan` (if installed)",
-        "  - `41_tls_findings.txt` contains **only** expired certificates and weak/legacy indicators",
         "- Passive web checks via `curl` (if installed)",
         "  - probe http/https, fetch `robots.txt`, `sitemap.xml`, `/.well-known/security.txt`",
         "  - extract links + form actions from homepage",
+        "- WhatWeb fingerprinting (if `whatweb` installed; only when base URL reachable)",
+        "- TLS scan via `sslscan` (if installed; by default only when HTTPS/443 evidence exists)",
         "- WordPress detection only (no scanning)",
         "- Optional allowlist endpoint checks: `--endpoint-file endpoints.txt`",
         "",
@@ -819,12 +925,24 @@ def process_target(
     mod_dns(t, tdir); prog.step_done(0.4)
     mod_whois(t, tdir, verbose); prog.step_done(0.8)
     mod_dig(t, tdir, verbose); prog.step_done(0.8)
+
     mod_nmap(t, tdir, scan_all, top_ports, timing, verbose); prog.step_done(1.2)
-    mod_whatweb(t, tdir, verbose); prog.step_done(0.8)
-    mod_sslscan(t, tdir, verbose); prog.step_done(0.8)
+    nmap_txt = read_text(tdir / "10_nmap.txt")
+
     web_ctx = mod_web_passive(t, tdir); prog.step_done(0.8)
-    mod_endpoint_checks(t, tdir, web_ctx.get("base_url", ""), endpoint_file); prog.step_done(0.6)
-    mod_wp_detect(t, tdir, web_ctx.get("base_url", ""), web_ctx.get("homepage_body", "")); prog.step_done(0.4)
+    base_url = web_ctx.get("base_url", "")
+
+    # WhatWeb only when there is something to fingerprint
+    mod_whatweb(t, tdir, verbose, base_url=base_url); prog.step_done(0.8)
+
+    # TLS scan only when there is evidence (by default)
+    tls_should_run = True
+    if bool(CONFIG.get("tls_only_if_https_or_443", True)):
+        tls_should_run = bool(base_url.startswith("https://")) or nmap_has_open_443(nmap_txt)
+    mod_sslscan(t, tdir, verbose, should_run=tls_should_run); prog.step_done(0.8)
+
+    mod_endpoint_checks(t, tdir, base_url, endpoint_file); prog.step_done(0.6)
+    mod_wp_detect(t, tdir, base_url, web_ctx.get("homepage_body", "")); prog.step_done(0.4)
     write_all_outputs(tdir); write_important_outputs(t, tdir); prog.step_done(0.6)
 
     return (t.raw, "done" if not STOP.is_set() else "stopped")
@@ -861,6 +979,15 @@ def main():
     ap.add_argument("--endpoint-file", default=None, help="Optional file of explicit allowlist paths to check (one per line).")
     ap.add_argument("--version", action="version", version=f"AutoKali v{VERSION}")
 
+    # Efficiency knobs
+    ap.add_argument("--timeout-mult", type=float, default=1.0, help="Multiply module timeouts (e.g. 0.5 faster, 2.0 slower).")
+    ap.add_argument("--http-timeout", type=int, default=DEFAULT_TIMEOUTS["http_fetch"], help="HTTP fetch max time (seconds).")
+    ap.add_argument("--http-probe-timeout", type=int, default=DEFAULT_TIMEOUTS["http_probe"], help="HTTP probe max time (seconds).")
+    ap.add_argument("--http-connect-timeout", type=int, default=DEFAULT_TIMEOUTS["http_connect"], help="HTTP connect timeout (seconds).")
+    ap.add_argument("--max-redirs", type=int, default=5, help="Max HTTP redirects to follow.")
+    ap.add_argument("--no-pn", action="store_true", help="Disable Nmap -Pn (host discovery enabled).")
+    ap.add_argument("--tls-always", action="store_true", help="Always run sslscan (do not require HTTPS/443 evidence).")
+
     # no-args => banner+help
     if len(sys.argv) == 1:
         ap.print_help()
@@ -870,6 +997,15 @@ def main():
 
     # banner for normal runs
     print(BANNER)
+
+    # Apply config
+    CONFIG["timeout_mult"] = max(0.1, float(args.timeout_mult))
+    CONFIG["http_timeout"] = max(1, int(args.http_timeout))
+    CONFIG["http_probe_timeout"] = max(1, int(args.http_probe_timeout))
+    CONFIG["http_connect_timeout"] = max(1, int(args.http_connect_timeout))
+    CONFIG["max_redirs"] = max(0, int(args.max_redirs))
+    CONFIG["use_pn"] = (not bool(args.no_pn))
+    CONFIG["tls_only_if_https_or_443"] = (not bool(args.tls_always))
 
     if not args.input:
         ap.print_help()
@@ -908,6 +1044,13 @@ def main():
         f"threads: {args.threads}\n"
         f"verbose: {args.verbose}\n"
         f"endpoint_file: {endpoint_file if endpoint_file else ''}\n"
+        f"timeout_mult: {CONFIG['timeout_mult']}\n"
+        f"http_timeout: {CONFIG['http_timeout']}\n"
+        f"http_probe_timeout: {CONFIG['http_probe_timeout']}\n"
+        f"http_connect_timeout: {CONFIG['http_connect_timeout']}\n"
+        f"max_redirs: {CONFIG['max_redirs']}\n"
+        f"use_pn: {CONFIG['use_pn']}\n"
+        f"tls_only_if_https_or_443: {CONFIG['tls_only_if_https_or_443']}\n"
         f"nmap: {'yes' if have_tool('nmap') else 'no'}\n"
         f"whatweb: {'yes' if have_tool('whatweb') else 'no'}\n"
         f"sslscan: {'yes' if have_tool('sslscan') else 'no'}\n"
@@ -922,7 +1065,8 @@ def main():
 
     if args.verbose != "low":
         mode = "ALL ports" if args.ScanAll else (f"top-{args.TopPorts}" if args.TopPorts else "common ports (-F)")
-        print(f"\nTargets: {len(targets)} | Nmap: {mode} | Threads: {args.threads}\n")
+        pn = "-Pn" if CONFIG["use_pn"] else "host-discovery"
+        print(f"\nTargets: {len(targets)} | Nmap: {mode} | {pn} | Threads: {args.threads}\n")
 
     # Manual executor so we can shutdown(wait=False) for fast Ctrl+C exit
     ex = cf.ThreadPoolExecutor(max_workers=max(1, args.threads))
@@ -958,7 +1102,6 @@ def main():
         try:
             ex.shutdown(wait=False, cancel_futures=True)
         except TypeError:
-            # older python fallback
             ex.shutdown(wait=False)
 
         if STOP.is_set():
