@@ -19,12 +19,13 @@ from urllib.parse import urljoin
 
 
 BANNER = r"""
-    _         _        _  __      _ _ 
+    _         _        _  __      _ _
    / \  _   _| |_ ___ | |/ /__ _ | (_)
   / _ \| | | | __/ _ \| ' // _` || | |
  / ___ \ |_| | || (_) | . \ (_| || | |
 /_/   \_\__,_|\__\___/|_|\_\__,_|/ |_|   AutoKali
 """
+
 
 # ---------------------------- utils ----------------------------
 
@@ -69,7 +70,22 @@ def read_text(p: Path) -> str:
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
 # ---------------------------- progress ----------------------------
+
+def fmt_time(sec: float) -> str:
+    sec = int(max(0, sec))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+def make_bar(frac: float, width: int = 30) -> str:
+    frac = max(0.0, min(1.0, frac))
+    fill = int(frac * width)
+    return "[" + ("#" * fill) + ("-" * (width - fill)) + "]"
 
 class Progress:
     def __init__(self, total_steps: int, verbose: str = "med"):
@@ -78,12 +94,11 @@ class Progress:
         self.t0 = time.time()
         self.lock = threading.Lock()
         self.verbose = verbose  # low/med/high
-        self.avg_step_sec = 6.0  # rolling average
+        self.avg_step_sec = 6.0
 
     def step_done(self, step_sec: float):
         with self.lock:
             self.done_steps += 1
-            # rolling average for ETA smoothing
             a = 0.15
             self.avg_step_sec = (1 - a) * self.avg_step_sec + a * max(0.1, step_sec)
         self.render(prefix="Overall", force=True)
@@ -106,20 +121,6 @@ class Progress:
         sys.stdout.write(msg)
         sys.stdout.flush()
 
-def fmt_time(sec: float) -> str:
-    sec = int(max(0, sec))
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-    if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-def make_bar(frac: float, width: int = 30) -> str:
-    frac = max(0.0, min(1.0, frac))
-    fill = int(frac * width)
-    return "[" + ("#" * fill) + ("-" * (width - fill)) + "]"
-
 def run_cmd_with_progress(
     cmd: List[str],
     out_file: Path,
@@ -129,11 +130,6 @@ def run_cmd_with_progress(
     est_sec: float,
     verbose: str,
 ) -> Tuple[int, str, float]:
-    """
-    Runs a command, writing stdout+stderr to file.
-    Shows a pseudo per-command progress bar with an estimate-based ETA.
-    Returns (rc, status, elapsed_sec).
-    """
     out_file.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
@@ -145,16 +141,15 @@ def run_cmd_with_progress(
     with out_file.open("wb") as f:
         try:
             p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=os.environ.copy())
-            # progress loop
             start = time.time()
             last_draw = 0.0
+
             while True:
                 rc = p.poll()
                 elapsed = time.time() - start
                 if rc is not None:
                     break
 
-                # draw at ~10 fps max
                 if time.time() - last_draw >= 0.1:
                     frac = min(0.95, elapsed / max(1.0, est_sec))
                     bar = make_bar(frac, width=28)
@@ -174,12 +169,10 @@ def run_cmd_with_progress(
                     f.write(b"\n[!] TIMEOUT\n")
                     sys.stdout.write(f"\r    {label:22} {make_bar(1.0,28)}  TIMEOUT          \n")
                     sys.stdout.flush()
-                    elapsed_total = time.time() - t0
-                    return 124, "timeout", elapsed_total
+                    return 124, "timeout", time.time() - t0
 
                 time.sleep(0.05)
 
-            # finalize bar
             sys.stdout.write(f"\r    {label:22} {make_bar(1.0,28)}  done            \n")
             sys.stdout.flush()
 
@@ -191,16 +184,17 @@ def run_cmd_with_progress(
             f.write(f"\n[!] ERROR: {e}\n".encode())
             sys.stdout.write(f"\r    {label:22} {make_bar(1.0,28)}  error           \n")
             sys.stdout.flush()
-            elapsed_total = time.time() - t0
-            return 1, "error", elapsed_total
+            return 1, "error", time.time() - t0
+
 
 # ---------------------------- core data ----------------------------
 
 @dataclass
 class Target:
     raw: str
-    kind: str       # ip|domain
+    kind: str
     ips: List[str]
+
 
 # ---------------------------- modules ----------------------------
 
@@ -219,9 +213,9 @@ def mod_nmap_ports_versions(
     t: Target, tdir: Path, scan_all: bool, top_ports: Optional[int], timing: str,
     prog: Progress, verbose: str
 ) -> None:
-    out_missing = tdir / "10_nmap_missing.txt"
     if not have_tool("nmap"):
-        out_missing.write_text("nmap not found in PATH\n", encoding="utf-8")
+        (tdir / "10_nmap_missing.txt").write_text("nmap not found in PATH\n", encoding="utf-8")
+        prog.step_done(0.2)
         return
 
     syn_ok = (os.geteuid() == 0)
@@ -246,22 +240,13 @@ def mod_nmap_ports_versions(
     ips_to_scan = t.ips if t.ips else ([t.raw] if is_ip(t.raw) else [])
     if not ips_to_scan:
         (tdir / "10_nmap_skipped.txt").write_text("no IPs to scan\n", encoding="utf-8")
+        prog.step_done(0.3)
         return
 
     for ip in ips_to_scan:
         out = tdir / f"10_nmap_{safe_name(ip)}.txt"
-        cmd = [
-            "nmap",
-            scan_flag,
-            *port_args,
-            "-sV",
-            "--version-light",
-            timing,
-            "--reason",
-            "-Pn",
-            ip,
-        ]
-        rc, status, sec = run_cmd_with_progress(cmd, out, timeout=timeout, label=label, prog=prog, est_sec=est, verbose=verbose)
+        cmd = ["nmap", scan_flag, *port_args, "-sV", "--version-light", timing, "--reason", "-Pn", ip]
+        _, _, sec = run_cmd_with_progress(cmd, out, timeout=timeout, label=label, prog=prog, est_sec=est, verbose=verbose)
         prog.step_done(sec)
 
 def mod_whatweb(t: Target, tdir: Path, prog: Progress, verbose: str) -> None:
@@ -272,7 +257,7 @@ def mod_whatweb(t: Target, tdir: Path, prog: Progress, verbose: str) -> None:
     out = tdir / "30_whatweb.txt"
     probes = [f"http://{t.raw}", f"https://{t.raw}"]
     cmd = ["whatweb", "--no-errors", "--color=never"] + probes
-    rc, status, sec = run_cmd_with_progress(cmd, out, timeout=900, label="whatweb", prog=prog, est_sec=10.0, verbose=verbose)
+    _, _, sec = run_cmd_with_progress(cmd, out, timeout=900, label="whatweb", prog=prog, est_sec=10.0, verbose=verbose)
     prog.step_done(sec)
 
 WEAK_TOKENS = [
@@ -337,7 +322,7 @@ def mod_tls_sslscan(t: Target, tdir: Path, prog: Progress, verbose: str) -> None
 
     raw_out = tdir / "40_sslscan_raw.txt"
     cmd = ["sslscan", "--no-colour", "--show-certificate"] + endpoints
-    rc, status, sec = run_cmd_with_progress(cmd, raw_out, timeout=1800, label="sslscan", prog=prog, est_sec=12.0, verbose=verbose)
+    _, _, sec = run_cmd_with_progress(cmd, raw_out, timeout=1800, label="sslscan", prog=prog, est_sec=12.0, verbose=verbose)
     prog.step_done(sec)
 
     findings_out = tdir / "41_tls_findings.txt"
@@ -352,16 +337,15 @@ def mod_tls_sslscan(t: Target, tdir: Path, prog: Progress, verbose: str) -> None
         if na:
             lines.append(f"NotAfter  (UTC): {na.isoformat()}")
         lines.append("")
-
     if weak_lines:
         lines.append("[WEAK/LEGACY INDICATORS]")
         lines.extend(weak_lines)
         lines.append("")
 
-    if not lines:
-        findings_out.write_text("No expired certs or obvious weak/legacy indicators found.\n", encoding="utf-8")
-    else:
-        findings_out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    findings_out.write_text(
+        ("No expired certs or obvious weak/legacy indicators found.\n" if not lines else "\n".join(lines) + "\n"),
+        encoding="utf-8",
+    )
 
 def http_fetch(url: str, timeout_s: int = 10, max_kb: int = 512) -> Tuple[int, Dict[str, str], str]:
     if not have_tool("curl"):
@@ -410,7 +394,6 @@ def mod_web_passive(t: Target, tdir: Path, prog: Progress, verbose: str) -> Dict
 
     out = tdir / "50_web_probe.txt"
     rows: List[str] = []
-
     candidates = [f"https://{t.raw}", f"http://{t.raw}"]
     chosen = ""
     body_chosen = ""
@@ -437,14 +420,13 @@ def mod_web_passive(t: Target, tdir: Path, prog: Progress, verbose: str) -> Dict
             "53_security_txt.txt": urljoin(chosen + "/", ".well-known/security.txt"),
         }
         for fname, url in fetch_map.items():
-            st, hdr, body = http_fetch(url, timeout_s=10, max_kb=256)
+            st, _, body = http_fetch(url, timeout_s=10, max_kb=256)
             (tdir / fname).write_text(f"URL: {url}\nStatus: {st}\n\n{body}\n", encoding="utf-8")
             prog.step_done(0.6)
 
         links = sorted(set(re.findall(r'href=["\']([^"\']+)["\']', body_chosen, flags=re.I)))
         forms = sorted(set(re.findall(r'<form[^>]+action=["\']([^"\']+)["\']', body_chosen, flags=re.I)))
-        extract = tdir / "54_homepage_extract.txt"
-        extract.write_text(
+        (tdir / "54_homepage_extract.txt").write_text(
             f"Base: {chosen}\n\n[LINKS]\n" + "\n".join(links[:500]) +
             "\n\n[FORM_ACTIONS]\n" + "\n".join(forms[:200]) + "\n",
             encoding="utf-8"
@@ -466,7 +448,7 @@ def mod_wp_detect(t: Target, tdir: Path, base_url: str, homepage_body: str, prog
 
     if base_url:
         for path in ("wp-login.php", "wp-json/"):
-            st, hdr, body = http_fetch(urljoin(base_url + "/", path), timeout_s=10, max_kb=32)
+            st, _, _ = http_fetch(urljoin(base_url + "/", path), timeout_s=10, max_kb=32)
             if st in (200, 301, 302, 401, 403):
                 evidence.append(f"Endpoint check: {path} returned {st}")
 
@@ -486,8 +468,6 @@ def mod_wp_detect(t: Target, tdir: Path, base_url: str, homepage_body: str, prog
     )
     prog.step_done(0.3)
 
-# ---------------------------- summaries ----------------------------
-
 def parse_nmap_open_ports(nmap_text: str) -> List[str]:
     out = []
     for l in nmap_text.splitlines():
@@ -505,16 +485,11 @@ def write_all_outputs(tdir: Path) -> None:
     (tdir / "90_all_outputs.txt").write_text("\n".join(chunks).rstrip() + "\n", encoding="utf-8")
 
 def write_important_outputs(t: Target, tdir: Path) -> None:
-    imp = []
-    imp.append(f"Target: {t.raw}")
-    imp.append(f"RunUTC: {now_utc()}")
-    imp.append("")
+    imp = [f"Target: {t.raw}", f"RunUTC: {now_utc()}", ""]
 
     dns = read_text(tdir / "00_dns.txt").strip()
     if dns:
-        imp.append("[DNS]")
-        imp.append(dns)
-        imp.append("")
+        imp += ["[DNS]", dns, ""]
 
     nmap_files = sorted(tdir.glob("10_nmap_*.txt"))
     open_lines: List[str] = []
@@ -524,15 +499,11 @@ def write_important_outputs(t: Target, tdir: Path) -> None:
             open_lines.append(f"{nf.name}:")
             open_lines.extend([f"  {x}" for x in opens])
     if open_lines:
-        imp.append("[OPEN PORTS]")
-        imp.extend(open_lines)
-        imp.append("")
+        imp += ["[OPEN PORTS]"] + open_lines + [""]
 
     tls = read_text(tdir / "41_tls_findings.txt").strip()
     if tls and not tls.lower().startswith("no expired certs"):
-        imp.append("[TLS FINDINGS]")
-        imp.append(tls)
-        imp.append("")
+        imp += ["[TLS FINDINGS]", tls, ""]
 
     probe = read_text(tdir / "50_web_probe.txt").strip()
     if probe:
@@ -541,17 +512,14 @@ def write_important_outputs(t: Target, tdir: Path) -> None:
             if l.startswith("URL:") or l.startswith("Status:") or l.lower().startswith(("server:", "x-powered-by:", "content-type:", "location:")):
                 key.append(l)
         if key:
-            imp.append("[WEB PROBE]")
-            imp.extend(key[:60])
-            imp.append("")
+            imp += ["[WEB PROBE]"] + key[:60] + [""]
 
     wp = read_text(tdir / "60_wp_detect.txt").strip()
     if wp.startswith("[WORDPRESS DETECTED]"):
-        imp.append("[WORDPRESS]")
-        imp.extend(wp.splitlines()[:25])
-        imp.append("")
+        imp += ["[WORDPRESS]"] + wp.splitlines()[:25] + [""]
 
     (tdir / "91_important.txt").write_text("\n".join(imp).rstrip() + "\n", encoding="utf-8")
+
 
 # ---------------------------- orchestration ----------------------------
 
@@ -577,6 +545,7 @@ def process_target(t: Target, outdir: Path, scan_all: bool, top_ports: Optional[
         print(f"\n=== Target {t.raw} ===")
 
     mod_dns(t, tdir)
+    prog.step_done(0.2)
 
     if t.kind == "domain" and not t.ips:
         (tdir / "10_nmap_skipped.txt").write_text("domain did not resolve; nmap skipped\n", encoding="utf-8")
@@ -587,7 +556,7 @@ def process_target(t: Target, outdir: Path, scan_all: bool, top_ports: Optional[
     mod_whatweb(t, tdir, prog, verbose)
     mod_tls_sslscan(t, tdir, prog, verbose)
     web_ctx = mod_web_passive(t, tdir, prog, verbose)
-    mod_wp_detect(t, tdir, web_ctx.get("base_url",""), web_ctx.get("homepage_body",""), prog)
+    mod_wp_detect(t, tdir, web_ctx.get("base_url", ""), web_ctx.get("homepage_body", ""), prog)
 
     write_all_outputs(tdir)
     write_important_outputs(t, tdir)
@@ -595,26 +564,122 @@ def process_target(t: Target, outdir: Path, scan_all: bool, top_ports: Optional[
     return (t.raw, "done")
 
 def build_readme_text() -> str:
-    return """# AutoKali
+    # Build safely without triple quotes
+    lines = [
+        "# AutoKali",
+        "",
+        "Safe recon runner that creates **one folder per target** and **one output file per module**, plus:",
+        "- `90_all_outputs.txt` (concatenation)",
+        "- `91_important.txt` (high-signal summary)",
+        "",
+        "## What it runs (default ON)",
+        "- DNS resolve (domains -> A/AAAA)",
+        "- Nmap ports + versions (default: common ports via `-F`)",
+        "  - `--TopPorts N` for top-N ports",
+        "  - `--ScanAll` for 1–65535 (`-p-`)",
+        "- WhatWeb fingerprinting",
+        "- TLS scan via `sslscan`",
+        "  - `41_tls_findings.txt` includes **only** expired certificates and weak/legacy indicators",
+        "- Passive web checks (no brute force)",
+        "  - probe http/https, fetch `robots.txt`, `sitemap.xml`, `/.well-known/security.txt`",
+        "  - extract links + form actions from homepage",
+        "- WordPress detection only (evidence + manual command suggestion)",
+        "",
+        "## Install",
+        "```bash",
+        "sudo apt update",
+        "sudo apt install -y nmap whatweb sslscan curl",
+        "```",
+        "",
+        "## Run",
+        "```bash",
+        "chmod +x autokali.py",
+        "./autokali.py -i targets.txt -o recon_out --threads 4 --verbose med",
+        "```",
+        "",
+        "## Notes",
+        "- This tool is intentionally **non-intrusive**: no directory brute forcing and no automated vulnerability scanners.",
+        "",
+    ]
+    return "\n".join(lines)
 
-Safe recon runner that creates **one folder per target** and **one output file per module**, plus:
-- `90_all_outputs.txt` (concatenation)
-- `91_important.txt` (high-signal summary)
+def main():
+    ap = argparse.ArgumentParser(
+        prog="autokali",
+        description="AutoKali: safe recon orchestrator with per-target folders, progress bars, and summaries.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    ap.add_argument("-i", "--input", help="Targets file (IPs/domains, one per line).")
+    ap.add_argument("-o", "--out", default="recon_out", help="Output directory.")
+    ap.add_argument("--threads", type=int, default=4, help="Parallel targets.")
+    ap.add_argument("--timing", default="-T3", choices=["-T2", "-T3", "-T4"], help="Nmap timing template.")
+    ap.add_argument("--ScanAll", action="store_true", help="Nmap all TCP ports (1-65535).")
+    ap.add_argument("--TopPorts", type=int, default=None, help="Nmap top N TCP ports (overrides default common ports).")
+    ap.add_argument("--verbose", default="med", choices=["low", "med", "high"], help="Verbosity level.")
+    ap.add_argument("--write-readme", action="store_true", help="Write README.md into the output directory.")
 
-## What it runs (default ON)
-- DNS resolve (domains -> A/AAAA)
-- Nmap ports + versions (default: common ports via `-F`)
-  - `--TopPorts N` for top-N ports
-  - `--ScanAll` for 1–65535 (`-p-`)
-- WhatWeb fingerprinting
-- TLS scan via `sslscan`
-  - `41_tls_findings.txt` includes **only** expired certificates and weak/legacy indicators
-- Passive web checks (no brute force)
-  - probe http/https, fetch `robots.txt`, `sitemap.xml`, `/.well-known/security.txt`
-  - extract links + form actions from homepage
-- WordPress detection only (evidence + manual command suggestion)
+    # Show help if user typed nothing (your request)
+    if len(sys.argv) == 1:
+        print(BANNER.strip("\n"))
+        ap.print_help()
+        sys.exit(0)
 
-## Install
-```bash
-sudo apt update
-sudo apt install -y nmap whatweb sslscan curl
+    args = ap.parse_args()
+
+    print(BANNER.strip("\n"))
+
+    # Require -i only when actually running
+    if not args.input:
+        ap.print_help()
+        sys.exit(2)
+
+    input_path = Path(args.input).expanduser()
+    outdir = Path(args.out).expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    targets = build_targets(input_path)
+    if not targets:
+        print("No valid targets found.")
+        sys.exit(1)
+
+    steps = 0
+    for t in targets:
+        nmap_steps = max(1, len(t.ips)) if (t.kind == "ip" or t.ips) else 1
+        # dns + nmap_per_ip + whatweb + sslscan + probe + 3 fetch + extract + wp
+        steps += 1 + nmap_steps + 1 + 1 + 1 + 3 + 1 + 1
+
+    prog = Progress(total_steps=steps, verbose=args.verbose)
+
+    (outdir / "_meta.txt").write_text(
+        "AutoKali run metadata\n"
+        f"run_utc: {now_utc()}\n"
+        f"targets: {len(targets)}\n"
+        f"ScanAll: {args.ScanAll}\n"
+        f"TopPorts: {args.TopPorts}\n"
+        f"threads: {args.threads}\n"
+        f"nmap: {'yes' if have_tool('nmap') else 'no'}\n"
+        f"whatweb: {'yes' if have_tool('whatweb') else 'no'}\n"
+        f"sslscan: {'yes' if have_tool('sslscan') else 'no'}\n"
+        f"curl: {'yes' if have_tool('curl') else 'no'}\n",
+        encoding="utf-8"
+    )
+
+    if args.write_readme:
+        (outdir / "README.md").write_text(build_readme_text(), encoding="utf-8")
+
+    if args.verbose != "low":
+        mode = "ALL ports" if args.ScanAll else (f"top-{args.TopPorts}" if args.TopPorts else "common ports (-F)")
+        print(f"\nTargets: {len(targets)} | Nmap: {mode} | Threads: {args.threads}\n")
+
+    with cf.ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
+        futs = [ex.submit(process_target, t, outdir, args.ScanAll, args.TopPorts, args.timing, prog, args.verbose) for t in targets]
+        for f in cf.as_completed(futs):
+            target, status = f.result()
+            if args.verbose != "low":
+                print(f"[+] {target}: {status}")
+
+    prog.render(prefix="Overall", force=True)
+    print("\nDone.")
+
+if __name__ == "__main__":
+    main()
