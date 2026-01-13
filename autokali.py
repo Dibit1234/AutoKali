@@ -26,6 +26,9 @@ BANNER = rf"""
   / _ \| | | | __/ _ \| ' // _` || | |
  / ___ \ |_| | || (_) | . \ (_| || | |
 /_/   \_\__,_|\__\___/|_|\_\__,_|/ |_|   AutoKali v{VERSION}
+ 
+ 
+ 
 """.rstrip("\n")
 
 # Global stop flag used for fast graceful exit
