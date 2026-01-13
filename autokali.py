@@ -19,11 +19,15 @@ from urllib.parse import urljoin
 VERSION = "1.3"
 
 BANNER = rf"""
+
     _         _        _  __      _ _
    / \  _   _| |_ ___ | |/ /__ _ | (_)
   / _ \| | | | __/ _ \| ' // _` || | |
  / ___ \ |_| | || (_) | . \ (_| || | |
 /_/   \_\__,_|\__\___/|_|\_\__,_|/ |_|   AutoKali v{VERSION}
+
+
+
 """.rstrip("\n")
 
 
