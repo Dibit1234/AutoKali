@@ -1,24 +1,45 @@
 # AutoKali
-A test kali autoscanner combining multiple well known kali tools.
 
-AutoKali is a **safe recon** runner that reads a target list (IPs/domains), creates **one folder per target**, and saves **one output file per module**, plus:
+AutoKali is a **safe recon** runner that creates **one folder per target** and writes **one output file per module**, plus:
 - `90_all_outputs.txt` (concatenation of all outputs)
 - `91_important.txt` (high-signal summary only)
 
-## What runs (default ON)
-- DNS resolution (domains -> IPs)
+## What it runs (defaults ON)
+### Network / Host
+- DNS resolve (domains -> A/AAAA)
+- WHOIS (if `whois` installed)
+- DIG record dump (if `dig` installed)
+
+### Port / Service Recon
 - Nmap ports + versions (default: common ports via `-F`)
   - `--TopPorts N` for top-N ports
   - `--ScanAll` for full 1–65535 (`-p-`)
-- WhatWeb fingerprinting
-- TLS scan via `sslscan`
-  - `41_tls_findings.txt` contains **only** expired certs + weak/legacy indicators
-- Passive web checks (no brute forcing)
-  - probe http/https, fetch `robots.txt`, `sitemap.xml`, `/.well-known/security.txt`
-  - extract links + form actions from homepage
-- WordPress detection **only** (evidence + manual command suggestion; not executed)
+  - Output is consolidated into **one file**: `10_nmap.txt` with sections:
+    ```
+    =======<IP>=======
+    <open port lines only>
+    [ERROR] <timeout/rc>  (if encountered)
+    ```
 
-## Install
+### Web (Passive)
+- WhatWeb fingerprinting (if `whatweb` installed)
+- TLS scan via `sslscan` (if installed)
+  - `41_tls_findings.txt` contains **only**:
+    - expired certificates
+    - weak/legacy cipher/protocol indicators
+- HTTP(S) probe + passive fetch via `curl` (if installed)
+  - fetch: `robots.txt`, `sitemap.xml`, `/.well-known/security.txt`
+  - extract homepage links + form actions (no brute forcing)
+
+### Detection Only
+- WordPress detection only (no scanning, no enumeration)
+
+### Optional Allowlist Checks
+- `--endpoint-file endpoints.txt`
+  - checks **only the explicit paths you provide** (one per line)
+  - writes `55_endpoint_checks.txt`
+
+## Install dependencies (Kali)
 ```bash
 sudo apt update
-sudo apt install -y nmap whatweb sslscan curl
+sudo apt install -y nmap whatweb sslscan curl dnsutils whois
