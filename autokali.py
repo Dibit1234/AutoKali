@@ -16,13 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
+VERSION = "1.3"
 
 BANNER = r"""
     _         _        _  __      _ _
    / \  _   _| |_ ___ | |/ /__ _ | (_)
   / _ \| | | | __/ _ \| ' // _` || | |
  / ___ \ |_| | || (_) | . \ (_| || | |
-/_/   \_\__,_|\__\___/|_|\_\__,_|/ |_|   AutoKali
+/_/   \_\__,_|\__\___/|_|\_\__,_|/ |_|   AutoKali v{VERSION}
 """.rstrip("\n")
 
 
