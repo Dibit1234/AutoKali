@@ -856,6 +856,9 @@ def main():
         sys.exit(0)
 
     args = ap.parse_args()
+    
+    # banner for normal runs
+    print(BANNER)
 
     if not args.input:
         ap.print_help()
