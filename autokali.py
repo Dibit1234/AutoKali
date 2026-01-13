@@ -6,6 +6,7 @@ import concurrent.futures as cf
 import ipaddress
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -16,20 +17,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
+
 VERSION = "1.3"
 
 BANNER = rf"""
-
     _         _        _  __      _ _
    / \  _   _| |_ ___ | |/ /__ _ | (_)
   / _ \| | | | __/ _ \| ' // _` || | |
  / ___ \ |_| | || (_) | . \ (_| || | |
 /_/   \_\__,_|\__\___/|_|\_\__,_|/ |_|   AutoKali v{VERSION}
- 
-
-
-   
 """.rstrip("\n")
+
+# Global stop flag used for fast graceful exit
+STOP = threading.Event()
 
 
 # ---------------------------- argparse (banner help) ----------------------------
@@ -112,7 +112,7 @@ class Progress:
         self.done_steps = 0
         self.t0 = time.time()
         self.lock = threading.Lock()
-        self.verbose = verbose  # low/med/high
+        self.verbose = verbose
         self.avg_step_sec = 6.0
 
     def step_done(self, step_sec: float):
@@ -140,52 +140,50 @@ class Progress:
         sys.stdout.write(msg)
         sys.stdout.flush()
 
-def run_cmd_file(cmd: List[str], out_file: Path, timeout: int) -> Tuple[int, str, float]:
-    """
-    Run a command, write stdout+stderr to out_file, return (rc, status, elapsed_seconds).
-    """
-    t0 = time.time()
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    with out_file.open("wb") as f:
-        try:
-            p = subprocess.run(
-                cmd,
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                timeout=timeout,
-                check=False,
-                env=os.environ.copy(),
-            )
-            elapsed = time.time() - t0
-            status = "ok" if p.returncode == 0 else f"rc={p.returncode}"
-            return p.returncode, status, elapsed
-        except subprocess.TimeoutExpired:
-            f.write(b"\n[!] TIMEOUT\n")
-            elapsed = time.time() - t0
-            return 124, "timeout", elapsed
-        except Exception as e:
-            f.write(f"\n[!] ERROR: {e}\n".encode())
-            elapsed = time.time() - t0
-            return 1, "error", elapsed
 
-def run_cmd_with_progress(cmd: List[str], out_file: Path, timeout: int, label: str, est_sec: float, verbose: str) -> Tuple[int, str, float]:
+# ---------------------------- subprocess runner (fast cancel) ----------------------------
+
+def run_cmd_with_progress(
+    cmd: List[str],
+    out_file: Path,
+    timeout: int,
+    label: str,
+    est_sec: float,
+    verbose: str,
+) -> Tuple[int, str, float]:
     """
-    Runs a command writing to file, prints an estimate-based per-command progress bar.
+    Runs a command writing stdout+stderr to a file.
+    Shows estimate-based per-command bar.
+    If Ctrl+C is pressed, terminates the subprocess and returns quickly.
     """
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+
     if verbose == "high":
         print(f"\n[cmd] {label}: {' '.join(cmd)}")
     elif verbose == "med":
         print(f"\n[*] {label}")
-
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
 
     with out_file.open("wb") as f:
         try:
             p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=os.environ.copy())
             start = time.time()
             last_draw = 0.0
+
             while True:
+                if STOP.is_set():
+                    try:
+                        p.terminate()
+                        time.sleep(0.2)
+                        if p.poll() is None:
+                            p.kill()
+                    except Exception:
+                        pass
+                    f.write(b"\n[!] STOPPED BY USER\n")
+                    sys.stdout.write(f"\r    {label:22} {make_bar(1.0,28)}  stopped         \n")
+                    sys.stdout.flush()
+                    return 130, "stopped", time.time() - t0
+
                 rc = p.poll()
                 elapsed = time.time() - start
                 if rc is not None:
@@ -202,7 +200,7 @@ def run_cmd_with_progress(cmd: List[str], out_file: Path, timeout: int, label: s
                 if elapsed > timeout:
                     try:
                         p.terminate()
-                        time.sleep(1)
+                        time.sleep(0.5)
                         if p.poll() is None:
                             p.kill()
                     except Exception:
@@ -228,21 +226,85 @@ def run_cmd_with_progress(cmd: List[str], out_file: Path, timeout: int, label: s
             return 1, "error", time.time() - t0
 
 
-# ---------------------------- core data ----------------------------
+def run_capture_with_stop(cmd: List[str], timeout: int) -> Tuple[int, str, str, float]:
+    """
+    Run command capturing combined stdout+stderr into memory (for filtering),
+    with STOP support (kills subprocess quickly).
+    """
+    t0 = time.time()
+    try:
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=os.environ.copy(),
+        )
+        chunks: List[bytes] = []
+        start = time.time()
+
+        while True:
+            if STOP.is_set():
+                try:
+                    p.terminate()
+                    time.sleep(0.2)
+                    if p.poll() is None:
+                        p.kill()
+                except Exception:
+                    pass
+                txt = b"".join(chunks).decode("utf-8", errors="ignore")
+                return 130, "stopped", txt, time.time() - t0
+
+            rc = p.poll()
+            if rc is not None:
+                # read remaining
+                try:
+                    rest = p.stdout.read() if p.stdout else b""
+                    if rest:
+                        chunks.append(rest)
+                except Exception:
+                    pass
+                txt = b"".join(chunks).decode("utf-8", errors="ignore")
+                status = "ok" if rc == 0 else f"rc={rc}"
+                return rc, status, txt, time.time() - t0
+
+            # read incrementally
+            try:
+                if p.stdout:
+                    data = p.stdout.read1(4096)
+                    if data:
+                        chunks.append(data)
+            except Exception:
+                pass
+
+            if time.time() - start > timeout:
+                try:
+                    p.terminate()
+                    time.sleep(0.5)
+                    if p.poll() is None:
+                        p.kill()
+                except Exception:
+                    pass
+                txt = b"".join(chunks).decode("utf-8", errors="ignore")
+                return 124, "timeout", txt, time.time() - t0
+
+            time.sleep(0.05)
+
+    except Exception as e:
+        return 1, f"error: {e}", "", time.time() - t0
+
+
+# ---------------------------- data ----------------------------
 
 @dataclass
 class Target:
     raw: str
-    kind: str       # ip|domain
-    ips: List[str]  # resolved IPs for domains, or [ip] for IP targets
+    kind: str
+    ips: List[str]
 
 
 # ---------------------------- web helpers ----------------------------
 
 def http_fetch(url: str, timeout_s: int = 10, max_kb: int = 512) -> Tuple[int, Dict[str, str], str]:
-    """
-    Fetch via curl. Returns (status_code, headers_lower_dict, body_snippet).
-    """
     if not have_tool("curl"):
         return 0, {}, ""
     cmd = ["curl", "-k", "-sS", "-L", "--max-time", str(timeout_s), "-D", "-", url]
@@ -330,44 +392,12 @@ def parse_sslscan_findings(text: str) -> Tuple[bool, List[str], Optional[datetim
 # ---------------------------- Nmap filtering ----------------------------
 
 def extract_nmap_open_port_lines(nmap_text: str) -> List[str]:
-    """
-    Keep only open port lines from normal Nmap output.
-    """
     lines = []
     for l in nmap_text.splitlines():
         l = l.strip()
         if re.match(r"^\d+/(tcp|udp)\s+open\s+", l):
             lines.append(re.sub(r"\s+", " ", l))
     return lines
-
-def run_nmap_capture(cmd: List[str], timeout: int) -> Tuple[int, str, str, float]:
-    """
-    Run Nmap and capture stdout+stderr in memory.
-    Returns (rc, status, output_text, elapsed_sec)
-    """
-    t0 = time.time()
-    try:
-        p = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
-            env=os.environ.copy(),
-        )
-        txt = p.stdout.decode("utf-8", errors="ignore")
-        status = "ok" if p.returncode == 0 else f"rc={p.returncode}"
-        return p.returncode, status, txt, time.time() - t0
-    except subprocess.TimeoutExpired as e:
-        txt = ""
-        if e.stdout:
-            try:
-                txt = e.stdout.decode("utf-8", errors="ignore")
-            except Exception:
-                txt = ""
-        return 124, "timeout", txt, time.time() - t0
-    except Exception as e:
-        return 1, f"error: {e}", "", time.time() - t0
 
 
 # ---------------------------- modules ----------------------------
@@ -385,11 +415,10 @@ def mod_whois(t: Target, tdir: Path, verbose: str) -> None:
     if not have_tool("whois"):
         write_text(out, "whois not found in PATH\n")
         return
-
-    q = t.raw
-    cmd = ["whois", q]
-    # whois can hang on some registries; keep a short timeout
-    run_cmd_with_progress(cmd, out, timeout=45, label="whois", est_sec=5.0, verbose=verbose)
+    if STOP.is_set():
+        write_text(out, "stopped\n")
+        return
+    run_cmd_with_progress(["whois", t.raw], out, timeout=45, label="whois", est_sec=5.0, verbose=verbose)
 
 def mod_dig(t: Target, tdir: Path, verbose: str) -> None:
     out = tdir / "02_dig.txt"
@@ -399,11 +428,21 @@ def mod_dig(t: Target, tdir: Path, verbose: str) -> None:
     if not have_tool("dig"):
         write_text(out, "dig not found in PATH\n")
         return
-    # useful baseline record types
+    if STOP.is_set():
+        write_text(out, "stopped\n")
+        return
     cmd = ["dig", "+noall", "+answer", t.raw, "A", "AAAA", "MX", "NS", "TXT"]
     run_cmd_with_progress(cmd, out, timeout=30, label="dig", est_sec=3.0, verbose=verbose)
 
 def mod_nmap(t: Target, tdir: Path, scan_all: bool, top_ports: Optional[int], timing: str, verbose: str) -> None:
+    """
+    Writes ONE file: 10_nmap.txt
+    Format:
+      =======IP=======
+      <open port lines only>
+      [ERROR] <timeout/rc/stopped> (if encountered)
+    No extra Nmap fluff.
+    """
     out = tdir / "10_nmap.txt"
     if not have_tool("nmap"):
         write_text(out, "[ERROR] nmap not found in PATH\n")
@@ -432,13 +471,19 @@ def mod_nmap(t: Target, tdir: Path, scan_all: bool, top_ports: Optional[int], ti
 
     chunks: List[str] = []
     for ip in ips_to_scan:
-        if verbose == "high":
-            print(f"\n[cmd] {label} ({ip})")
-        elif verbose == "med":
+        if STOP.is_set():
+            chunks.append(f"======={ip}======")
+            chunks.append("[ERROR] stopped")
+            chunks.append("")
+            continue
+
+        if verbose == "med":
             print(f"\n[*] {label} ({ip})")
+        elif verbose == "high":
+            print(f"\n[cmd] {label} ({ip})")
 
         cmd = ["nmap", scan_flag, *port_args, "-sV", "--version-light", timing, "--reason", "-Pn", ip]
-        rc, status, txt, _sec = run_nmap_capture(cmd, timeout=timeout)
+        rc, status, txt, _sec = run_capture_with_stop(cmd, timeout=timeout)
 
         chunks.append(f"======={ip}======")
 
@@ -451,7 +496,6 @@ def mod_nmap(t: Target, tdir: Path, scan_all: bool, top_ports: Optional[int], ti
         else:
             if status == "ok":
                 chunks.append("No open ports found.")
-
         chunks.append("")
 
     write_text(out, "\n".join(chunks).rstrip() + "\n")
@@ -460,6 +504,9 @@ def mod_whatweb(t: Target, tdir: Path, verbose: str) -> None:
     out = tdir / "30_whatweb.txt"
     if not have_tool("whatweb"):
         write_text(out, "whatweb not found in PATH\n")
+        return
+    if STOP.is_set():
+        write_text(out, "stopped\n")
         return
     probes = [f"http://{t.raw}", f"https://{t.raw}"]
     cmd = ["whatweb", "--no-errors", "--color=never"] + probes
@@ -472,6 +519,10 @@ def mod_sslscan(t: Target, tdir: Path, verbose: str) -> None:
     if not have_tool("sslscan"):
         write_text(raw_out, "sslscan not found in PATH\n")
         write_text(findings_out, "sslscan not found in PATH\n")
+        return
+    if STOP.is_set():
+        write_text(raw_out, "stopped\n")
+        write_text(findings_out, "stopped\n")
         return
 
     endpoints: List[str] = []
@@ -506,22 +557,16 @@ def mod_sslscan(t: Target, tdir: Path, verbose: str) -> None:
         lines.extend(weak_lines)
         lines.append("")
 
-    if not lines:
-        write_text(findings_out, "No expired certs or obvious weak/legacy indicators found.\n")
-    else:
-        write_text(findings_out, "\n".join(lines) + "\n")
+    write_text(findings_out, "No expired certs or obvious weak/legacy indicators found.\n" if not lines else "\n".join(lines) + "\n")
 
 def mod_web_passive(t: Target, tdir: Path) -> Dict[str, str]:
-    """
-    Passive web checks via curl:
-      - probe http/https
-      - fetch robots.txt / sitemap.xml / .well-known/security.txt
-      - extract links + form actions from homepage
-    """
     probe_out = tdir / "50_web_probe.txt"
-
     if not have_tool("curl"):
         write_text(probe_out, "curl not found in PATH\n")
+        return {"base_url": "", "homepage_body": ""}
+
+    if STOP.is_set():
+        write_text(probe_out, "stopped\n")
         return {"base_url": "", "homepage_body": ""}
 
     candidates = [f"https://{t.raw}", f"http://{t.raw}"]
@@ -530,6 +575,8 @@ def mod_web_passive(t: Target, tdir: Path) -> Dict[str, str]:
     rows: List[str] = []
 
     for url in candidates:
+        if STOP.is_set():
+            break
         st, hdr, body = http_fetch(url, timeout_s=10, max_kb=512)
         rows.append(f"URL: {url}")
         rows.append(f"Status: {st}")
@@ -543,33 +590,30 @@ def mod_web_passive(t: Target, tdir: Path) -> Dict[str, str]:
 
     write_text(probe_out, "\n".join(rows).rstrip() + "\n")
 
-    if chosen:
+    if chosen and not STOP.is_set():
         fetch_map = {
             "51_robots.txt": urljoin(chosen + "/", "robots.txt"),
             "52_sitemap.txt": urljoin(chosen + "/", "sitemap.xml"),
             "53_security_txt.txt": urljoin(chosen + "/", ".well-known/security.txt"),
         }
         for fname, url in fetch_map.items():
+            if STOP.is_set():
+                break
             st, _hdr, body = http_fetch(url, timeout_s=10, max_kb=256)
             write_text(tdir / fname, f"URL: {url}\nStatus: {st}\n\n{body}\n")
 
-        links = sorted(set(re.findall(r'href=["\']([^"\']+)["\']', body_chosen, flags=re.I)))
-        forms = sorted(set(re.findall(r'<form[^>]+action=["\']([^"\']+)["\']', body_chosen, flags=re.I)))
-
-        extract_out = tdir / "54_homepage_extract.txt"
-        write_text(
-            extract_out,
-            f"Base: {chosen}\n\n[LINKS]\n" + "\n".join(links[:500]) +
-            "\n\n[FORM_ACTIONS]\n" + "\n".join(forms[:200]) + "\n"
-        )
+        if not STOP.is_set():
+            links = sorted(set(re.findall(r'href=["\']([^"\']+)["\']', body_chosen, flags=re.I)))
+            forms = sorted(set(re.findall(r'<form[^>]+action=["\']([^"\']+)["\']', body_chosen, flags=re.I)))
+            write_text(
+                tdir / "54_homepage_extract.txt",
+                f"Base: {chosen}\n\n[LINKS]\n" + "\n".join(links[:500]) +
+                "\n\n[FORM_ACTIONS]\n" + "\n".join(forms[:200]) + "\n"
+            )
 
     return {"base_url": chosen, "homepage_body": body_chosen}
 
 def mod_endpoint_checks(t: Target, tdir: Path, base_url: str, endpoint_file: Optional[Path]) -> None:
-    """
-    Optional: check a user-provided allowlist of paths (no built-in admin list).
-    Writes 55_endpoint_checks.txt.
-    """
     out = tdir / "55_endpoint_checks.txt"
     if not endpoint_file:
         write_text(out, "endpoint checks skipped (no --endpoint-file provided)\n")
@@ -582,6 +626,9 @@ def mod_endpoint_checks(t: Target, tdir: Path, base_url: str, endpoint_file: Opt
         return
     if not have_tool("curl"):
         write_text(out, "curl not found in PATH\n")
+        return
+    if STOP.is_set():
+        write_text(out, "stopped\n")
         return
 
     paths = []
@@ -599,15 +646,16 @@ def mod_endpoint_checks(t: Target, tdir: Path, base_url: str, endpoint_file: Opt
 
     rows = [f"Base: {base_url}", f"EndpointFile: {endpoint_file}", ""]
     for p in paths:
+        if STOP.is_set():
+            rows.append("[STOPPED]")
+            break
         url = urljoin(base_url + "/", p.lstrip("/"))
-        st, hdr, _body = http_fetch(url, timeout_s=10, max_kb=16)
+        st, _hdr, _body = http_fetch(url, timeout_s=10, max_kb=16)
         rows.append(f"{st:>3}  {p}  ({url})")
+
     write_text(out, "\n".join(rows).rstrip() + "\n")
 
 def mod_wp_detect(t: Target, tdir: Path, base_url: str, homepage_body: str) -> None:
-    """
-    Detection only (no scanning).
-    """
     out = tdir / "60_wp_detect.txt"
     evidence: List[str] = []
 
@@ -620,7 +668,7 @@ def mod_wp_detect(t: Target, tdir: Path, base_url: str, homepage_body: str) -> N
         if re.search(r'<meta[^>]+name=["\']generator["\'][^>]+wordpress', homepage_body, flags=re.I):
             evidence.append("Homepage: generator meta indicates WordPress")
 
-    if base_url:
+    if base_url and not STOP.is_set():
         for path in ("wp-login.php", "wp-json/"):
             st, _hdr, _body = http_fetch(urljoin(base_url + "/", path), timeout_s=10, max_kb=16)
             if st in (200, 301, 302, 401, 403):
@@ -630,13 +678,7 @@ def mod_wp_detect(t: Target, tdir: Path, base_url: str, homepage_body: str) -> N
         write_text(out, "No WordPress indicators detected.\n")
         return
 
-    target_url = base_url if base_url else f"https://{t.raw}"
-    write_text(
-        out,
-        "[WORDPRESS DETECTED]\n" +
-        "\n".join(f"- {e}" for e in evidence) +
-        "\n"
-    )
+    write_text(out, "[WORDPRESS DETECTED]\n" + "\n".join(f"- {e}" for e in evidence) + "\n")
 
 
 # ---------------------------- aggregations ----------------------------
@@ -652,33 +694,21 @@ def write_all_outputs(tdir: Path) -> None:
     write_text(out, "\n".join(chunks).rstrip() + "\n")
 
 def write_important_outputs(t: Target, tdir: Path) -> None:
-    """
-    High-signal only:
-      - DNS resolved IPs
-      - Open ports (from 10_nmap.txt)
-      - TLS findings (only if meaningful)
-      - Web probe key lines
-      - WP detected (only if detected)
-      - Endpoint checks summary (only if provided)
-    """
     imp: List[str] = [f"Target: {t.raw}", f"RunUTC: {now_utc()}", ""]
 
     dns = read_text(tdir / "00_dns.txt").strip()
     if dns:
         imp += ["[DNS]", dns, ""]
 
-    # Open ports from consolidated Nmap file (only port lines)
     nmap_txt = read_text(tdir / "10_nmap.txt")
     open_lines = [l for l in nmap_txt.splitlines() if re.match(r"^\d+/(tcp|udp)\s+open\s+", l)]
     if open_lines:
         imp += ["[OPEN PORTS]"] + open_lines + [""]
 
-    # TLS findings: only if something found
     tls = read_text(tdir / "41_tls_findings.txt").strip()
     if tls and not tls.lower().startswith("no expired certs"):
         imp += ["[TLS FINDINGS]", tls, ""]
 
-    # Web probe: keep only key lines
     probe = read_text(tdir / "50_web_probe.txt").strip()
     if probe:
         key = []
@@ -688,13 +718,10 @@ def write_important_outputs(t: Target, tdir: Path) -> None:
         if key:
             imp += ["[WEB PROBE]"] + key[:60] + [""]
 
-    # Endpoint checks (only if enabled)
     ep = read_text(tdir / "55_endpoint_checks.txt").strip()
     if ep and not ep.lower().startswith("endpoint checks skipped"):
-        # include first ~80 lines max
         imp += ["[ENDPOINT CHECKS]"] + ep.splitlines()[:80] + [""]
 
-    # WordPress detect only if detected
     wp = read_text(tdir / "60_wp_detect.txt").strip()
     if wp.startswith("[WORDPRESS DETECTED]"):
         imp += ["[WORDPRESS]"] + wp.splitlines()[:50] + [""]
@@ -708,11 +735,13 @@ def build_readme_text() -> str:
     lines = [
         "# AutoKali",
         "",
+        f"Version: **{VERSION}**",
+        "",
         "AutoKali is a **safe recon** runner that creates **one folder per target** and writes **one output file per module**, plus:",
         "- `90_all_outputs.txt` (concatenation of all outputs)",
         "- `91_important.txt` (high-signal summary only)",
         "",
-        "## What it runs (defaults ON)",
+        "## What it runs (defaults ON if tool exists)",
         "- DNS resolve (domains -> A/AAAA)",
         "- WHOIS (if `whois` installed)",
         "- DIG DNS records (if `dig` installed)",
@@ -727,7 +756,7 @@ def build_readme_text() -> str:
         "  - probe http/https, fetch `robots.txt`, `sitemap.xml`, `/.well-known/security.txt`",
         "  - extract links + form actions from homepage",
         "- WordPress detection only (no scanning)",
-        "- Optional allowlist endpoint checks (no built-in admin lists): `--endpoint-file endpoints.txt`",
+        "- Optional allowlist endpoint checks: `--endpoint-file endpoints.txt`",
         "",
         "## Install dependencies (Kali)",
         "```bash",
@@ -741,21 +770,8 @@ def build_readme_text() -> str:
         "./autokali.py -i targets.txt -o recon_out --threads 4 --verbose med",
         "```",
         "",
-        "Full port scan:",
-        "```bash",
-        "sudo ./autokali.py -i targets.txt -o recon_out --ScanAll",
-        "```",
-        "",
-        "Allowlist endpoint checks:",
-        "```bash",
-        "printf \"/login\\n/admin\\n\" > endpoints.txt",
-        "./autokali.py -i targets.txt -o recon_out --endpoint-file endpoints.txt",
-        "```",
-        "",
-        "## Verbosity",
-        "- `--verbose low`  minimal output",
-        "- `--verbose med`  module-level progress + bars",
-        "- `--verbose high` prints command lines too",
+        "## Graceful exit",
+        "- Press `Ctrl+C` once to stop quickly with no traceback.",
         "",
     ]
     return "\n".join(lines)
@@ -787,55 +803,45 @@ def process_target(
     endpoint_file: Optional[Path],
     prog: Progress,
 ) -> Tuple[str, str]:
+    if STOP.is_set():
+        return (t.raw, "stopped")
+
     tdir = outdir / safe_name(t.raw)
     tdir.mkdir(parents=True, exist_ok=True)
 
     if verbose != "low":
         print(f"\n=== Target {t.raw} ===")
 
-    # dns
-    mod_dns(t, tdir)
-    prog.step_done(0.3)
+    # coarse steps for ETA smoothness
+    mod_dns(t, tdir); prog.step_done(0.4)
+    mod_whois(t, tdir, verbose); prog.step_done(0.8)
+    mod_dig(t, tdir, verbose); prog.step_done(0.8)
+    mod_nmap(t, tdir, scan_all, top_ports, timing, verbose); prog.step_done(1.2)
+    mod_whatweb(t, tdir, verbose); prog.step_done(0.8)
+    mod_sslscan(t, tdir, verbose); prog.step_done(0.8)
+    web_ctx = mod_web_passive(t, tdir); prog.step_done(0.8)
+    mod_endpoint_checks(t, tdir, web_ctx.get("base_url", ""), endpoint_file); prog.step_done(0.6)
+    mod_wp_detect(t, tdir, web_ctx.get("base_url", ""), web_ctx.get("homepage_body", "")); prog.step_done(0.4)
+    write_all_outputs(tdir); write_important_outputs(t, tdir); prog.step_done(0.6)
 
-    # whois / dig
-    mod_whois(t, tdir, verbose)
-    prog.step_done(1.0)
+    return (t.raw, "done" if not STOP.is_set() else "stopped")
 
-    mod_dig(t, tdir, verbose)
-    prog.step_done(1.0)
 
-    # nmap (consolidated)
-    mod_nmap(t, tdir, scan_all, top_ports, timing, verbose)
-    prog.step_done(8.0 if scan_all else 3.0)
+# ---------------------------- Ctrl+C handling ----------------------------
 
-    # whatweb
-    mod_whatweb(t, tdir, verbose)
-    prog.step_done(1.0)
+def _sigint_handler(signum, frame):
+    # First Ctrl+C triggers STOP and returns immediately.
+    if not STOP.is_set():
+        STOP.set()
+        print("\n[!] Ctrl+C received — stopping now...")
+    else:
+        # second Ctrl+C: immediate exit
+        os._exit(130)
 
-    # tls
-    mod_sslscan(t, tdir, verbose)
-    prog.step_done(1.0)
-
-    # web passive
-    web_ctx = mod_web_passive(t, tdir)
-    prog.step_done(1.0)
-
-    # allowlist endpoint checks
-    mod_endpoint_checks(t, tdir, web_ctx.get("base_url", ""), endpoint_file)
-    prog.step_done(0.8)
-
-    # wp detect
-    mod_wp_detect(t, tdir, web_ctx.get("base_url", ""), web_ctx.get("homepage_body", ""))
-    prog.step_done(0.3)
-
-    # aggregation
-    write_all_outputs(tdir)
-    write_important_outputs(t, tdir)
-    prog.step_done(0.5)
-
-    return (t.raw, "done")
 
 def main():
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     ap = BannerArgumentParser(
         prog="autokali",
         description="AutoKali: safe recon orchestrator with per-target folders, progress bars, and summaries.",
@@ -850,19 +856,15 @@ def main():
     ap.add_argument("--verbose", default="med", choices=["low", "med", "high"], help="Verbosity level.")
     ap.add_argument("--write-readme", action="store_true", help="Write README.md into the output directory.")
     ap.add_argument("--endpoint-file", default=None, help="Optional file of explicit allowlist paths to check (one per line).")
+    ap.add_argument("--version", action="version", version=f"AutoKali v{VERSION}")
 
-    # If typed nothing, show banner+help
+    # no-args => banner+help
     if len(sys.argv) == 1:
         ap.print_help()
         sys.exit(0)
 
-    # If only -h/--help, show banner+help
-    if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
-        ap.print_help()
-        sys.exit(0)
-
     args = ap.parse_args()
-    
+
     # banner for normal runs
     print(BANNER)
 
@@ -876,7 +878,7 @@ def main():
         print(f"    Provided: {args.input}")
         print(f"    Resolved: {input_path}")
         print(f"    CWD:      {Path.cwd()}")
-        print("\n    Tip: run `ls -la` to confirm the file name, or pass an absolute path.")
+        print("\n    Tip: run `ls -la` or pass an absolute path.")
         sys.exit(2)
 
     outdir = Path(args.out).expanduser().resolve()
@@ -886,16 +888,16 @@ def main():
 
     targets = build_targets(input_path)
     if not targets:
-        print("No valid targets found.")
+        print("[!] No valid targets found.")
         sys.exit(1)
 
-    # Steps: keep it stable, not perfect. Used for overall ETA smoothing.
-    steps_per_target = 10  # coarse buckets
-    total_steps = steps_per_target * len(targets)
+    # simple ETA model
+    total_steps = max(1, 10 * len(targets))
     prog = Progress(total_steps=total_steps, verbose=args.verbose)
 
     (outdir / "_meta.txt").write_text(
         "AutoKali run metadata\n"
+        f"version: {VERSION}\n"
         f"run_utc: {now_utc()}\n"
         f"targets: {len(targets)}\n"
         f"ScanAll: {args.ScanAll}\n"
@@ -919,28 +921,50 @@ def main():
         mode = "ALL ports" if args.ScanAll else (f"top-{args.TopPorts}" if args.TopPorts else "common ports (-F)")
         print(f"\nTargets: {len(targets)} | Nmap: {mode} | Threads: {args.threads}\n")
 
-    with cf.ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
-        futs = [
-            ex.submit(
-                process_target,
-                t,
-                outdir,
-                args.ScanAll,
-                args.TopPorts,
-                args.timing,
-                args.verbose,
-                endpoint_file,
-                prog,
-            )
-            for t in targets
-        ]
-        for f in cf.as_completed(futs):
-            target, status = f.result()
-            if args.verbose != "low":
-                print(f"[+] {target}: {status}")
+    # Manual executor so we can shutdown(wait=False) for fast Ctrl+C exit
+    ex = cf.ThreadPoolExecutor(max_workers=max(1, args.threads))
+    futs: List[cf.Future] = []
+
+    try:
+        for t in targets:
+            if STOP.is_set():
+                break
+            futs.append(ex.submit(
+                process_target, t, outdir, args.ScanAll, args.TopPorts, args.timing, args.verbose, endpoint_file, prog
+            ))
+
+        # Poll completion without blocking forever so Ctrl+C is always responsive
+        while futs and not STOP.is_set():
+            done, not_done = cf.wait(futs, timeout=0.2, return_when=cf.FIRST_COMPLETED)
+            for f in done:
+                try:
+                    target, status = f.result()
+                    if args.verbose != "low":
+                        print(f"[+] {target}: {status}")
+                except Exception as e:
+                    if not STOP.is_set():
+                        print(f"[!] Error: {e}")
+            futs = list(not_done)
+
+    finally:
+        # Cancel anything not started
+        for f in futs:
+            f.cancel()
+
+        # Fast shutdown: don't wait for thread joins
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            # older python fallback
+            ex.shutdown(wait=False)
+
+        if STOP.is_set():
+            print("\n[!] AutoKali stopped by user.")
+            sys.exit(130)
 
     prog.render(prefix="Overall", force=True)
-    print("\nDone.")
+    print("\n[+] AutoKali finished.")
+
 
 if __name__ == "__main__":
     main()
