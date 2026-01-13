@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 VERSION = "1.3"
 
-BANNER = r"""
+BANNER = rf"""
     _         _        _  __      _ _
    / \  _   _| |_ ___ | |/ /__ _ | (_)
   / _ \| | | | __/ _ \| ' // _` || | |
