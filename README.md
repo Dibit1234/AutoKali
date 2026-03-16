@@ -13,7 +13,7 @@ AutoKali is a **safe recon** runner that creates **one folder per target** and w
 ### Port / Service Recon
 - Nmap ports + versions (default: common ports via `-F`)
   - `--TopPorts N` for top-N ports
-  - `--ScanAll` for full 1–65535 (`-p-`)
+  - `--ScanAll` for full 1-65535 (`-p-`)
   - Output is consolidated into **one file**: `10_nmap.txt` with sections:
     ```
     =======<IP>=======
@@ -43,3 +43,4 @@ AutoKali is a **safe recon** runner that creates **one folder per target** and w
 ```bash
 sudo apt update
 sudo apt install -y nmap whatweb sslscan curl dnsutils whois
+```
